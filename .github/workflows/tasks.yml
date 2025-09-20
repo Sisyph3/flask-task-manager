@@ -48,14 +48,14 @@ jobs:
               curl -s "$url" | jq .
               ;;
 
-         add)
-  title_json=$(printf '{"title":"%s"}' "${TITLE}")
-  curl -s -X POST "$base_url/api/tasks" \
-    -H "Authorization: Bearer $API_TOKEN" \
-    -H "Content-Type: application/json" \
-    -d "$title_json" | jq .
-  ;;
-
+            add)
+              # Construit le JSON sans heredoc (évite les erreurs YAML/jq)
+              title_json=$(printf '{"title":"%s"}' "${TITLE}")
+              curl -s -X POST "$base_url/api/tasks" \
+                -H "Authorization: Bearer $API_TOKEN" \
+                -H "Content-Type: application/json" \
+                -d "$title_json" | jq .
+              ;;
 
             done)
               curl -s -X POST "$base_url/api/tasks/${ID}/done" \
