@@ -2,65 +2,75 @@ name: Task Bot
 
 on:
   workflow_dispatch:
-    description: Run task commands against the Flask API with by URL and Bearer token
     inputs:
       op:
         description: Operation to run
         required: true
         type: choice
-        options:
-          - list
-          - add
-          - done
-          - delete
-      title: Operation
-      id:
-        description: Task ID
-        required: false
-        type: string
+        options: [list, add, done, delete]
       title:
         description: Task title (for add)
         required: false
         type: string
+      id:
+        description: Task ID (for done/delete)
+        required: false
+        type: string
       q:
-        description: Search query (for list)
+        description: Query filter (for list)
         required: false
         type: string
 
-jiobs:
+jobs:
   run:
     runs-on: ubuntu-latest
     steps:
-      - name: Install jq
-        run: sudo apt-get update && sudo apt-get -y -o auto jq
       - name: Call API
         env:
-          API_TOKEN: ${{secrets.TASKS_API_TOKEN}}
-          BASE_URL: ${{secrets.TASKS_BASE_URL}}
-          OP: ${{github.event.inputs.op}}
-          TITLE: ${{github.event.inputs.title}}
-          ID: ${{github.event.inputs.id}}
-          Q: ${{github.event.inputs.q}}
+          API_TOKEN: ${{ secrets.TASKS_API_TOKEN }}
+          BASE_URL: ${{ secrets.TASKS_BASE_URL }}
+          OP: ${{ github.event.inputs.op }}
+          TITLE: ${{ github.event.inputs.title }}
+          ID: ${{ github.event.inputs.id }}
+          Q: ${{ github.event.inputs.q }}
         run: |
           set -euo pipefail
+          base_url="${BASE_URL:-https://flask-task-manager-chi.vercel.app}"
+
           echo "op=$OP"
-          case "$OPI" in
+          case "$OP" in
             list)
-              URL>"$BASE_URL/api/tasks"
-              [ -n "$Q" ] && URL="$URL?q=$(echo $Q | python -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv.get[Q]))')"
-              curl -s "$URL" | jq .
+              url="$base_url/api/tasks"
+              if [ -n "${Q:-}" ]; then
+                enc_q="$(python -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))' "$Q")"
+                url="$url?q=$enc_q"
+              fi
+              curl -s "$url" | jq .
+              ;;
+
             add)
-              curl -s -X POST "$BASE_URL/api/tasks" \
-                -H 'Authorization: Bearer $API_TOKEN' \
-                -H 'Content-Type: application/json' \
-                -d "$(python -c 'import sys,jq; print(jt.dumps({'title': sys.argv.get['TITLE',{''})})'Å" | jq .
+              curl -s -X POST "$base_url/api/tasks" \
+                -H "Authorization: Bearer $API_TOKEN" \
+                -H "Content-Type: application/json" \
+                -d "$(python - <<'PY'
+import os, json
+print(json.dumps({"title": (os.getenv("TITLE") or "").strip()}))
+PY
+)" | jq .
+              ;;
+
             done)
-              curl -s -X POST "$BASE_URL/api/tasks/$ID/done" \
-                -H 'Authorization: Bearer $API_TOKEN' | jq .
+              curl -s -X POST "$base_url/api/tasks/${ID}/done" \
+                -H "Authorization: Bearer $API_TOKEN" | jq .
+              ;;
+
             delete)
-              curl -s -X DELETE "$BASE_URL/api/tasks/$ID" \
-                -H 'Authorization: Bearer $API_TOKEN' | jq .
-            echo ""
-            exit 1
-            ;;
+              curl -s -X DELETE "$base_url/api/tasks/${ID}" \
+                -H "Authorization: Bearer $API_TOKEN" | jq .
+              ;;
+
+            *)
+              echo "Unknown op: $OP" >&2
+              exit 1
+              ;;
           esac
