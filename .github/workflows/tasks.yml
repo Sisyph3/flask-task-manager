@@ -1,79 +1,301 @@
-name: Task Bot (IssueOps)
+name: Tasks IssueOps
 
 on:
   issue_comment:
-    types: [created]
+    types: [created, edited]
+  workflow_dispatch: {}
+
+# Évite les collisions si plusieurs commentaires arrivent en même temps sur la même issue
+concurrency:
+  group: tasks-issueops-${{ github.event.issue.number || github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
   issues: write
 
+env:
+  # Mention à utiliser dans les commentaires
+  BOT_HANDLE: "@bot"
+
+  # Base URL + token (déjà configurés dans vos Secrets)
+  TASKS_BASE_URL: ${{ secrets.TASKS_BASE_URL }}
+  TASKS_API_TOKEN: ${{ secrets.TASKS_API_TOKEN }}
+
+  # Chemins d'API AJUSTABLES selon votre service Flask (laisser tels quels si REST classique)
+  TASKS_LIST_PATH: "/tasks"
+  TASKS_ADD_PATH: "/tasks"
+  TASKS_DONE_PATH: "/tasks/{id}"         # PATCH avec {"status":"done"} (ou ajustez p.ex. "/tasks/{id}/complete")
+  TASKS_DELETE_PATH: "/tasks/{id}"       # DELETE
+
 jobs:
-  handle:
-    if: ${{ github.event.issue.pull_request == null }}
+  issueops:
+    name: Parse comment and call Tasks API
     runs-on: ubuntu-latest
+
+    # Ne s'exécute que si le commentaire contient la mention du bot
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'issue_comment' &&
+       contains(github.event.comment.body, env.BOT_HANDLE))
+
     steps:
-      - name: Parse comment & call API
-        env:
-          BODY: ${{ github.event.comment.body }}
-          API_TOKEN: ${{ secrets.TASKS_API_TOKEN }}
-          BASE_URL: ${{ secrets.TASKS_BASE_URL }}
+      - name: Vérifications de base
         run: |
-          set -euo pipefail
-          base_url="${BASE_URL:-https://flask-task-manager-chi.vercel.app}"
+          test -n "${TASKS_BASE_URL}" || (echo "❌ TASKS_BASE_URL manquant (Secret)" && exit 1)
+          test -n "${TASKS_API_TOKEN}" || (echo "❌ TASKS_API_TOKEN manquant (Secret)" && exit 1)
 
-          echo "Comment: $BODY"
-
-          respond() {
-            # Post a comment back with the result (pretty JSON or message)
-            local msg="$1"
-            jq -rn --arg body "$msg" '{body:$body}' > body.json
-            curl -s -X POST \
-              -H "Authorization: Bearer $GITHUB_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${GITHUB_REPOSITORY}/issues/${{ github.event.issue.number }}/comments" \
-              -d @body.json >/dev/null
-          }
-
-          if [[ "$BODY" =~ ^/task[[:space:]]+add[[:space:]]+(.+)$ ]]; then
-            title="${BASH_REMATCH[1]}"
-            payload=$(printf '{"title":"%s"}' "$title")
-            resp=$(curl -s -X POST "$base_url/api/tasks" \
-              -H "Authorization: Bearer $API_TOKEN" \
-              -H "Content-Type: application/json" \
-              -d "$payload")
-            respond "✅ **add** →\n\`\`\`json\n$(echo "$resp" | jq .)\n\`\`\`"
-            exit 0
-          fi
-
-          if [[ "$BODY" =~ ^/task[[:space:]]+done[[:space:]]+([0-9]+)$ ]]; then
-            id="${BASH_REMATCH[1]}"
-            resp=$(curl -s -X POST "$base_url/api/tasks/${id}/done" \
-              -H "Authorization: Bearer $API_TOKEN")
-            respond "✅ **done $id** →\n\`\`\`json\n$(echo "$resp" | jq .)\n\`\`\`"
-            exit 0
-          fi
-
-          if [[ "$BODY" =~ ^/task[[:space:]]+delete[[:space:]]+([0-9]+)$ ]]; then
-            id="${BASH_REMATCH[1]}"
-            resp=$(curl -s -X DELETE "$base_url/api/tasks/${id}" \
-              -H "Authorization: Bearer $API_TOKEN")
-            respond "✅ **delete $id** →\n\`\`\`json\n$(echo "$resp" | jq .)\n\`\`\`"
-            exit 0
-          fi
-
-          if [[ "$BODY" =~ ^/task[[:space:]]+list(?:[[:space:]]+q=(.+))?$ ]]; then
-            q="${BASH_REMATCH[1]:-}"
-            url="$base_url/api/tasks"
-            if [[ -n "$q" ]]; then
-              enc_q=$(python -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))' "$q")
-              url="$url?q=$enc_q"
-            fi
-            resp=$(curl -s "$url")
-            respond "📋 **list** ${q:+(q=$q)} →\n\`\`\`json\n$(echo "$resp" | jq .)\n\`\`\`"
-            exit 0
-          fi
-
-          respond "ℹ️ Commandes supportées :\n- \`/task add <titre>\`\n- \`/task done <id>\`\n- \`/task delete <id>\`\n- \`/task list [q=mot]\`"
+      - name: IssueOps via github-script
+        uses: actions/github-script@v7
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_ISSUE_NUMBER: ${{ github.event.issue.number }}
+          GH_REPO: ${{ github.repository }}
+          GH_COMMENT_BODY: ${{ github.event.comment.body }}
+          GH_COMMENT_ID: ${{ github.event.comment.id }}
+          GH_ACTOR: ${{ github.actor }}
+        with:
+          script: |
+            const core = require('@actions/core');
+
+            // -------- Helpers
+            const BOT_HANDLE = process.env.BOT_HANDLE || "@bot";
+            const BASE = process.env.TASKS_BASE_URL.replace(/\/+$/, ""); // trim trailing slash
+            const TOKEN = process.env.TASKS_API_TOKEN;
+
+            // Endpoints configurables
+            const PATHS = {
+              list:  process.env.TASKS_LIST_PATH  || "/tasks",
+              add:   process.env.TASKS_ADD_PATH   || "/tasks",
+              done:  process.env.TASKS_DONE_PATH  || "/tasks/{id}",
+              del:   process.env.TASKS_DELETE_PATH|| "/tasks/{id}",
+            };
+
+            const issueNumber = process.env.GH_ISSUE_NUMBER || (context.payload.issue && context.payload.issue.number);
+            const issueUrl = context.payload.issue && context.payload.issue.html_url;
+            const repo = process.env.GH_REPO || `${context.repo.owner}/${context.repo.repo}`;
+            const commentBody = process.env.GH_COMMENT_BODY || "";
+
+            // Utilitaires HTTP
+            async function apiFetch(path, opts = {}) {
+              const url = `${BASE}${path}`;
+              const headers = {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${TOKEN}`,
+                // Optionnel : laissez si votre backend supporte aussi ce header
+                'X-API-Token': TOKEN,
+                ...(opts.headers || {})
+              };
+              const res = await fetch(url, { ...opts, headers });
+              let data = null;
+              const text = await res.text();
+              try { data = text ? JSON.parse(text) : null; } catch { data = text; }
+              if (!res.ok) {
+                const msg = `HTTP ${res.status} ${res.statusText} -> ${url}\n${text}`;
+                throw new Error(msg);
+              }
+              return data;
+            }
+
+            function mdEscape(s='') {
+              return String(s).replace(/([\\`*_{}[\]()#+\-.!|>])/g, '\\$1');
+            }
+
+            function formatTasksList(tasks) {
+              if (!Array.isArray(tasks) || tasks.length === 0) return "_Aucune tâche._";
+              // Normalise diverses structures possibles : [{id,title,completed|status}]
+              return tasks.map(t => {
+                const id = t.id ?? t._id ?? t.uuid ?? "?";
+                const title = t.title ?? t.name ?? t.label ?? "(sans titre)";
+                const done = typeof t.completed === 'boolean' ? t.completed
+                           : (typeof t.status === 'string' ? t.status.toLowerCase() === 'done' : false);
+                const box = done ? "☑︎" : "☐";
+                return `- ${box} **#${id}** — ${mdEscape(title)}`;
+              }).join("\n");
+            }
+
+            async function getTasks() {
+              return apiFetch(PATHS.list, { method: 'GET' });
+            }
+
+            async function findTaskId(arg) {
+              // Si arg est un ID numérique/UUID -> retourne tel quel
+              if (!arg) return null;
+              const idLike = arg.trim().replace(/^#/, '');
+              // heuristique simple : si tout est chiffres, supposez ID
+              if (/^[0-9]+$/.test(idLike) || /^[0-9a-f-]{6,}$/i.test(idLike)) {
+                return idLike;
+              }
+              // Sinon, chercher par titre (exact / insensible à la casse)
+              const tasks = await getTasks();
+              const lower = idLike.replace(/^"|"$/g, '').toLowerCase();
+              const found = Array.isArray(tasks) ? tasks.find(t => {
+                const title = (t.title ?? t.name ?? '').toLowerCase();
+                return title === lower;
+              }) : null;
+              return found ? (found.id ?? found._id ?? found.uuid) : null;
+            }
+
+            async function addTask(title) {
+              const payload = {
+                title: title,
+                source: 'github',
+                metadata: {
+                  issue_url: issueUrl,
+                  repository: repo,
+                  actor: process.env.GH_ACTOR
+                }
+              };
+              return apiFetch(PATHS.add, { method: 'POST', body: JSON.stringify(payload) });
+            }
+
+            async function completeTask(id) {
+              if (PATHS.done.includes('{id}')) {
+                const path = PATHS.done.replace('{id}', encodeURIComponent(id));
+                // Essayez PATCH status: done
+                try {
+                  return await apiFetch(path, { method: 'PATCH', body: JSON.stringify({ status: 'done' }) });
+                } catch (e) {
+                  core.info(`PATCH status failed, trying POST complete: ${e.message}`);
+                  // En fallback, POST sans body
+                  return await apiFetch(path, { method: 'POST' });
+                }
+              } else {
+                // Si votre API exige un autre endpoint statique
+                return apiFetch(PATHS.done, { method: 'POST', body: JSON.stringify({ id, status: 'done' }) });
+              }
+            }
+
+            async function deleteTask(id) {
+              if (PATHS.del.includes('{id}')) {
+                const path = PATHS.del.replace('{id}', encodeURIComponent(id));
+                return apiFetch(path, { method: 'DELETE' });
+              } else {
+                return apiFetch(PATHS.del, { method: 'DELETE', body: JSON.stringify({ id }) });
+              }
+            }
+
+            function parseCommand(raw) {
+              // Cherche @bot <cmd> ...
+              const re = new RegExp(`${BOT_HANDLE.replace('@','@')}\\s+(\\w+)([\\s\\S]*)`, 'i');
+              const m = raw.match(re);
+              if (!m) return null;
+              const cmd = (m[1] || '').toLowerCase();
+              const rest = (m[2] || '').trim();
+
+              // Pour add, privilégie un titre entre guillemets "..."
+              let title = null;
+              const q = rest.match(/"([^"]+)"/);
+              if (q) title = q[1].trim();
+              else if (cmd === 'add' && rest) title = rest;
+
+              // Pour done/delete, on prend soit un id (#123) soit "titre"
+              let target = null;
+              if (cmd === 'done' || cmd === 'delete') {
+                const mId = rest.match(/#?([0-9a-f-]{1,})/i);
+                const mQuoted = rest.match(/"([^"]+)"/);
+                if (mQuoted) target = `"${mQuoted[1].trim()}"`;
+                else if (mId) target = mId[1];
+                else target = rest;
+              }
+
+              return { cmd, title, rest, target };
+            }
+
+            async function commentReply(body) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: Number(issueNumber),
+                body
+              });
+            }
+
+            // -------- Main
+            try {
+              // Si déclenché manuellement, démo "help"
+              const raw = context.eventName === 'workflow_dispatch'
+                ? `${BOT_HANDLE} help`
+                : (commentBody || '');
+
+              const parsed = parseCommand(raw);
+              if (!parsed) {
+                core.info("No recognizable command after bot handle.");
+                return;
+              }
+
+              const { cmd, title, target } = parsed;
+
+              if (cmd === 'help') {
+                await commentReply([
+                  "🤖 **IssueOps — commandes disponibles :**",
+                  "",
+                  `- \`${BOT_HANDLE} add "Titre de la tâche"\``,
+                  `- \`${BOT_HANDLE} list\``,
+                  `- \`${BOT_HANDLE} done <#id | "titre">\``,
+                  `- \`${BOT_HANDLE} delete <#id | "titre">\``,
+                  "",
+                  "_Astuce : les chemins d’API peuvent être ajustés via les variables d’environnement du workflow._"
+                ].join("\n"));
+                return;
+              }
+
+              if (cmd === 'list') {
+                const tasks = await getTasks();
+                await commentReply(`🗒️ **Tâches actuelles**\n\n${formatTasksList(tasks)}`);
+                return;
+              }
+
+              if (cmd === 'add') {
+                if (!title) {
+                  await commentReply(`⚠️ Usage : \`${BOT_HANDLE} add "Titre de la tâche"\``);
+                  return;
+                }
+                const created = await addTask(title);
+                const id = created?.id ?? created?._id ?? created?.uuid ?? "?";
+                await commentReply(`✅ Tâche ajoutée : **#${id}** — ${mdEscape(title)}`);
+                return;
+              }
+
+              if (cmd === 'done' || cmd === 'complete') {
+                if (!target) {
+                  await commentReply(`⚠️ Usage : \`${BOT_HANDLE} done <#id | "titre">\``);
+                  return;
+                }
+                const id = await findTaskId(target);
+                if (!id) {
+                  await commentReply(`❌ Impossible de trouver la tâche cible \`${mdEscape(target)}\`.`);
+                  return;
+                }
+                await completeTask(id);
+                await commentReply(`🎉 Tâche **#${id}** marquée comme *done*.`);
+                return;
+              }
+
+              if (cmd === 'delete' || cmd === 'remove' || cmd === 'del') {
+                if (!target) {
+                  await commentReply(`⚠️ Usage : \`${BOT_HANDLE} delete <#id | "titre">\``);
+                  return;
+                }
+                const id = await findTaskId(target);
+                if (!id) {
+                  await commentReply(`❌ Impossible de trouver la tâche cible \`${mdEscape(target)}\`.`);
+                  return;
+                }
+                await deleteTask(id);
+                await commentReply(`🗑️ Tâche **#${id}** supprimée.`);
+                return;
+              }
+
+              await commentReply(`🤷 Commande inconnue. Essayez \`${BOT_HANDLE} help\`.`);
+
+            } catch (error) {
+              core.warning(error.stack || String(error));
+              const msg = error.message ? `\n\n\`\`\`\n${error.message.substring(0, 4000)}\n\`\`\`` : '';
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: Number(process.env.GH_ISSUE_NUMBER),
+                body: `❌ **Erreur IssueOps**${msg}\n_Vérifiez les Secrets/URLs et les chemins d’API dans le workflow._`
+              });
+              throw error;
+            }
