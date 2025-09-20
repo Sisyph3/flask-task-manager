@@ -1,74 +1,79 @@
-name: Task Bot
+name: Task Bot (IssueOps)
 
 on:
-  workflow_dispatch:
-    inputs:
-      op:
-        description: Operation to run
-        required: true
-        type: choice
-        options: [list, add, done, delete]
-      title:
-        description: Task title (for add)
-        required: false
-        type: string
-      id:
-        description: Task ID (for done/delete)
-        required: false
-        type: string
-      q:
-        description: Query filter (for list)
-        required: false
-        type: string
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  issues: write
 
 jobs:
-  run:
+  handle:
+    if: ${{ github.event.issue.pull_request == null }}
     runs-on: ubuntu-latest
     steps:
-      - name: Call API
+      - name: Parse comment & call API
         env:
+          BODY: ${{ github.event.comment.body }}
           API_TOKEN: ${{ secrets.TASKS_API_TOKEN }}
           BASE_URL: ${{ secrets.TASKS_BASE_URL }}
-          OP: ${{ github.event.inputs.op }}
-          TITLE: ${{ github.event.inputs.title }}
-          ID: ${{ github.event.inputs.id }}
-          Q: ${{ github.event.inputs.q }}
         run: |
           set -euo pipefail
           base_url="${BASE_URL:-https://flask-task-manager-chi.vercel.app}"
 
-          echo "op=$OP"
-          case "$OP" in
-            list)
-              url="$base_url/api/tasks"
-              if [ -n "${Q:-}" ]; then
-                enc_q="$(python -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))' "$Q")"
-                url="$url?q=$enc_q"
-              fi
-              curl -s "$url" | jq .
-              ;;
+          echo "Comment: $BODY"
 
-            add)
-              # Construit le JSON sans heredoc (évite les erreurs YAML/jq)
-              title_json=$(printf '{"title":"%s"}' "${TITLE}")
-              curl -s -X POST "$base_url/api/tasks" \
-                -H "Authorization: Bearer $API_TOKEN" \
-                -H "Content-Type: application/json" \
-                -d "$title_json" | jq .
-              ;;
+          respond() {
+            # Post a comment back with the result (pretty JSON or message)
+            local msg="$1"
+            jq -rn --arg body "$msg" '{body:$body}' > body.json
+            curl -s -X POST \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/issues/${{ github.event.issue.number }}/comments" \
+              -d @body.json >/dev/null
+          }
 
-            done)
-              curl -s -X POST "$base_url/api/tasks/${ID}/done" \
-                -H "Authorization: Bearer $API_TOKEN" | jq .
-              ;;
+          if [[ "$BODY" =~ ^/task[[:space:]]+add[[:space:]]+(.+)$ ]]; then
+            title="${BASH_REMATCH[1]}"
+            payload=$(printf '{"title":"%s"}' "$title")
+            resp=$(curl -s -X POST "$base_url/api/tasks" \
+              -H "Authorization: Bearer $API_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "$payload")
+            respond "✅ **add** →\n\`\`\`json\n$(echo "$resp" | jq .)\n\`\`\`"
+            exit 0
+          fi
 
-            delete)
-              curl -s -X DELETE "$base_url/api/tasks/${ID}" \
-                -H "Authorization: Bearer $API_TOKEN" | jq .
-              ;;
+          if [[ "$BODY" =~ ^/task[[:space:]]+done[[:space:]]+([0-9]+)$ ]]; then
+            id="${BASH_REMATCH[1]}"
+            resp=$(curl -s -X POST "$base_url/api/tasks/${id}/done" \
+              -H "Authorization: Bearer $API_TOKEN")
+            respond "✅ **done $id** →\n\`\`\`json\n$(echo "$resp" | jq .)\n\`\`\`"
+            exit 0
+          fi
 
-            *)
-              echo "Unknown op: $OP" >&2
-              exit 1
-              ;;
-          esac
+          if [[ "$BODY" =~ ^/task[[:space:]]+delete[[:space:]]+([0-9]+)$ ]]; then
+            id="${BASH_REMATCH[1]}"
+            resp=$(curl -s -X DELETE "$base_url/api/tasks/${id}" \
+              -H "Authorization: Bearer $API_TOKEN")
+            respond "✅ **delete $id** →\n\`\`\`json\n$(echo "$resp" | jq .)\n\`\`\`"
+            exit 0
+          fi
+
+          if [[ "$BODY" =~ ^/task[[:space:]]+list(?:[[:space:]]+q=(.+))?$ ]]; then
+            q="${BASH_REMATCH[1]:-}"
+            url="$base_url/api/tasks"
+            if [[ -n "$q" ]]; then
+              enc_q=$(python -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))' "$q")
+              url="$url?q=$enc_q"
+            fi
+            resp=$(curl -s "$url")
+            respond "📋 **list** ${q:+(q=$q)} →\n\`\`\`json\n$(echo "$resp" | jq .)\n\`\`\`"
+            exit 0
+          fi
+
+          respond "ℹ️ Commandes supportées :\n- \`/task add <titre>\`\n- \`/task done <id>\`\n- \`/task delete <id>\`\n- \`/task list [q=mot]\`"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
