@@ -1,228 +1,265 @@
-name: Tasks IssueOps
+name: Install IssueOps Shim
 
 on:
-  issue_comment:
-    types: [created, edited]
-  workflow_dispatch:
-
-concurrency:
-  group: tasks-issueops-${{ github.event.issue.number || github.run_id }}
-  cancel-in-progress: false
+  workflow_dispatch: {}
 
 permissions:
-  contents: read
-  issues: write
-
-env:
-  BOT_HANDLE: "@bot"
-  TASKS_BASE_URL: ${{ secrets.TASKS_BASE_URL }}
-  TASKS_API_TOKEN: ${{ secrets.TASKS_API_TOKEN }}
-  TASKS_LIST_PATH: "/tasks"
-  TASKS_ADD_PATH: "/tasks"
-  TASKS_DONE_PATH: "/tasks/{id}"
-  TASKS_DELETE_PATH: "/tasks/{id}"
+  contents: write
+  pull-requests: write
 
 jobs:
-  issueops:
-    name: Parse comment and call Tasks API
+  install:
     runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'issue_comment' || github.event_name == 'workflow_dispatch' }}
-
     steps:
-      - name: Vérifications de base
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Create branch
         run: |
-          test -n "${TASKS_BASE_URL}" || (echo "❌ TASKS_BASE_URL manquant (Secret)" && exit 1)
-          test -n "${TASKS_API_TOKEN}" || (echo "❌ TASKS_API_TOKEN manquant (Secret)" && exit 1)
+          set -e
+          BR="chore/issueops-shim"
+          git checkout -b "$BR" || git checkout "$BR"
 
-      - name: IssueOps via github-script
-        uses: actions/github-script@v7
-        env:
-          GH_ISSUE_NUMBER: ${{ github.event.issue.number }}
-          GH_REPO: ${{ github.repository }}
-          GH_COMMENT_BODY: ${{ github.event.comment.body }}
-          GH_COMMENT_ID: ${{ github.event.comment.id }}
-          GH_ACTOR: ${{ github.actor }}
+      - name: Add issueops.py (HMAC GET shim)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f issueops.py ]; then
+            echo "issueops.py already exists; will overwrite to ensure latest."
+          fi
+          cat > issueops.py <<'PY'
+from __future__ import annotations
+import hmac, hashlib, time, os, json
+from typing import Optional, List, Dict, Any
+from flask import Blueprint, request, jsonify, current_app, abort
+
+bp_issueops = Blueprint("issueops", __name__)
+
+TS_TOLERANCE = 300  # 5 minutes
+
+def _get_token_bytes() -> bytes:
+  token = (
+    current_app.config.get("TASKS_API_TOKEN")
+    or os.environ.get("TASKS_API_TOKEN")
+    or current_app.config.get("API_TOKEN")
+    or os.environ.get("API_TOKEN")
+  )
+  if not token:
+    abort(500, "TASKS_API_TOKEN non configuré")
+  return token.encode("utf-8") if isinstance(token, str) else token
+
+def _valid_sig(op: str, title: Optional[str], tid: Optional[str], ts: str, sig: str) -> bool:
+  payload = f"{op}|{title or ''}|{tid or ''}|{ts}".encode("utf-8")
+  digest = hmac.new(_get_token_bytes(), payload, hashlib.sha256).hexdigest()
+  return hmac.compare_digest(digest, (sig or "").lower())
+
+def _assert_fresh(ts: str) -> None:
+  try:
+    ts_i = int(ts)
+  except Exception:
+    abort(400, "timestamp invalide")
+  now = int(time.time())
+  if abs(now - ts_i) > TS_TOLERANCE:
+    abort(400, "requête expirée")
+
+# ---- Intégration: essaye d'appeler la logique interne si dispo; sinon fallback HTTP vers /tasks ----
+
+def _call_internal_service(op: str, title: Optional[str], tid: Optional[str]) -> Any:
+  """
+  Essaie d'utiliser des fonctions locales si elles existent, sinon fallback HTTP.
+  """
+  # 1) Tentative d'import de fonctions "service"
+  svc_candidates = [
+    ("services.tasks", ("add_task","get_tasks","mark_done","remove_task")),
+    ("app.tasks", ("add_task","get_tasks","mark_done","remove_task")),
+    ("tasks", ("add_task","get_tasks","mark_done","remove_task")),
+  ]
+  for mod, names in svc_candidates:
+    try:
+      m = __import__(mod, fromlist=list(names))
+      add, lst, done, rm = (getattr(m, names[0]), getattr(m, names[1]), getattr(m, names[2]), getattr(m, names[3]))
+      if op == "add":
+        if not title: abort(400, "title manquant")
+        task = add(title)
+        return {"ok": True, "task": task}
+      elif op == "list":
+        tasks = lst()
+        return {"ok": True, "tasks": tasks}
+      elif op == "done":
+        if not tid: abort(400, "id manquant")
+        task = done(tid)
+        return {"ok": True, "task": task}
+      elif op == "delete":
+        if not tid: abort(400, "id manquant")
+        rm(tid)
+        return {"ok": True}
+    except Exception:
+      pass  # Continue vers fallback HTTP
+
+  # 2) Fallback HTTP vers les endpoints REST existants (/tasks, /tasks/{id})
+  import urllib.request, urllib.parse
+
+  base = (
+    current_app.config.get("TASKS_BASE_URL")
+    or os.environ.get("TASKS_BASE_URL")
+    or ""
+  ).rstrip("/")
+  if not base:
+    # essaie d'inférer depuis l'URL publique de Vercel si connue (optionnel)
+    base = ""
+
+  headers = {
+    "Authorization": f"Bearer {os.environ.get('TASKS_API_TOKEN') or current_app.config.get('TASKS_API_TOKEN','')}",
+    "Content-Type": "application/json",
+  }
+
+  def _req(url: str, method: str = "GET", data: Optional[dict] = None) -> Any:
+    dbytes = None
+    if data is not None:
+      dbytes = json.dumps(data).encode("utf-8")
+    req = urllib.request.Request(url, data=dbytes, method=method, headers=headers)
+    with urllib.request.urlopen(req, timeout=15) as resp:
+      raw = resp.read().decode("utf-8")
+      try:
+        return json.loads(raw)
+      except Exception:
+        return {"raw": raw}
+
+  if op == "add":
+    if not title: abort(400, "title manquant")
+    return {"ok": True, "task": _req(base + "/tasks", method="POST", data={"title": title, "source": "issueops"})}
+  elif op == "list":
+    return {"ok": True, "tasks": _req(base + "/tasks", method="GET")}
+  elif op == "done":
+    if not tid: abort(400, "id manquant")
+    # PATCH status=done (fallback POST)
+    path = f"/tasks/{urllib.parse.quote(tid)}"
+    try:
+      return {"ok": True, "task": _req(base + path, method="PATCH", data={"status": "done"})}
+    except Exception:
+      return {"ok": True, "task": _req(base + path, method="POST")}
+  elif op == "delete":
+    if not tid: abort(400, "id manquant")
+    path = f"/tasks/{urllib.parse.quote(tid)}"
+    _req(base + path, method="DELETE")
+    return {"ok": True}
+
+  abort(400, "op inconnue")
+
+@bp_issueops.get("/issueops")
+def issueops():
+  """
+  GET /issueops?op=add&title=Apprendre&ts=...&sig=...
+  GET /issueops?op=list&ts=...&sig=...
+  GET /issueops?op=done&id=123&ts=...&sig=...
+  GET /issueops?op=delete&id=123&ts=...&sig=...
+  """
+  op = (request.args.get("op") or "").strip().lower()
+  title = request.args.get("title")
+  tid = request.args.get("id")
+  ts = request.args.get("ts")
+  sig = (request.args.get("sig") or "").strip().lower()
+
+  if not op or not ts or not sig:
+    abort(400, "Paramètres requis: op, ts, sig")
+
+  _assert_fresh(ts)
+  if not _valid_sig(op, title, tid, ts, sig):
+    abort(401, "signature invalide")
+
+  result = _call_internal_service(op, title, tid)
+  return jsonify(result)
+PY
+
+      - name: Auto-register blueprint in Flask entrypoint
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Trouver un fichier d'entrée probable
+          ENTRY=$(git ls-files | grep -E '^(app|main|wsgi)\.py$' | head -n1 || true)
+          if [ -z "$ENTRY" ]; then
+            echo "❌ Impossible de trouver app.py/main.py/wsgi.py à la racine du repo."
+            echo "Ajoute manuellement l'enregistrement du blueprint dans ton fichier Flask principal :"
+            echo "  from issueops import bp_issueops"
+            echo "  app.register_blueprint(bp_issueops)"
+            exit 1
+          fi
+
+          # Patch via un petit script Python (plus robuste que sed)
+          python - "$ENTRY" <<'PY'
+import io, sys, re, pathlib
+
+path = pathlib.Path(sys.argv[1])
+src = path.read_text(encoding="utf-8")
+
+changed = False
+
+# 1) Import
+if re.search(r'^\s*from\s+issueops\s+import\s+bp_issueops\s*$', src, flags=re.M):
+    pass
+else:
+    # insérer après le premier import
+    m = re.search(r'^(from\s+\S+\s+import\s+\S+|import\s+\S+)', src, flags=re.M)
+    insert_at = m.end() if m else 0
+    src = src[:insert_at] + ("\n" if insert_at else "") + "from issueops import bp_issueops\n" + src[insert_at:]
+    changed = True
+
+# 2) Enregistrement du blueprint
+# Cas A: app = Flask(__name__) (hors factory)
+if re.search(r'^\s*app\s*=\s*Flask\(', src, flags=re.M):
+    # enregistrer une fois, juste après la première occurrence
+    def repl_once(match):
+        block = match.group(0)
+        if "register_blueprint(bp_issueops)" in src:
+            return block
+        return block + "\napp.register_blueprint(bp_issueops)\n"
+    src_new = re.sub(r'^\s*app\s*=\s*Flask\([^\n]*\)\s*$', repl_once, src, count=1, flags=re.M)
+    if src_new != src:
+        src = src_new
+        changed = True
+
+# Cas B: factory def create_app(): ... app = Flask(__name__)
+if re.search(r'^\s*def\s+create_app\s*\(', src, flags=re.M) and "register_blueprint(bp_issueops)" not in src:
+    # Injecter à l'intérieur de la factory, après la première occurrence de app = Flask(...)
+    pattern = r'(def\s+create_app\s*\([^\)]*\)\s*:[\s\S]*?)(^\s*app\s*=\s*Flask\([^\n]*\)\s*$)'
+    m = re.search(pattern, src, flags=re.M)
+    if m:
+        start = m.end(2)
+        indent = re.match(r'^(\s*)app\s*=\s*Flask', m.group(2)).group(1)
+        inject = f"\n{indent}app.register_blueprint(bp_issueops)\n"
+        src = src[:start] + inject + src[start:]
+        changed = True
+
+if changed:
+    path.write_text(src, encoding="utf-8")
+    print(f"Patched {path}")
+else:
+    print(f"No changes needed in {path}")
+PY
+
+      - name: Commit and push
+        run: |
+          set -e
+          git add issueops.py
+          git add app.py || true
+          git add main.py || true
+          git add wsgi.py || true
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git commit -m "chore: add IssueOps GET shim (+ auto-register blueprint)"
+            git push -u origin "$(git branch --show-current)"
+          fi
+
+      - name: Open PR
+        uses: peter-evans/create-pull-request@v6
         with:
-          script: |
-            // ⬅️ NE PAS re-déclarer `core`, `github`, `context` (déjà injectés par github-script)
-
-            // -------- Config
-            const BOT_HANDLE = process.env.BOT_HANDLE || "@bot";
-            const BASE = (process.env.TASKS_BASE_URL || "").replace(/\/+$/, "");
-            const TOKEN = process.env.TASKS_API_TOKEN;
-
-            const PATHS = {
-              list:  process.env.TASKS_LIST_PATH  || "/tasks",
-              add:   process.env.TASKS_ADD_PATH   || "/tasks",
-              done:  process.env.TASKS_DONE_PATH  || "/tasks/{id}",
-              del:   process.env.TASKS_DELETE_PATH|| "/tasks/{id}",
-            };
-
-            const issueNumber = process.env.GH_ISSUE_NUMBER || (context.payload.issue && context.payload.issue.number);
-            const issueUrl = context.payload.issue && context.payload.issue.html_url;
-            const repo = process.env.GH_REPO || `${context.repo.owner}/${context.repo.repo}`;
-            const commentBody = process.env.GH_COMMENT_BODY || "";
-            const hasIssue = !!issueNumber;
-
-            // -------- HTTP util
-            async function apiFetch(path, opts = {}) {
-              if (!BASE) throw new Error("TASKS_BASE_URL manquant.");
-              const url = `${BASE}${path}`;
-              const headers = {
-                "Content-Type": "application/json",
-                "Authorization": `Bearer ${TOKEN}`,
-                "X-API-Token": TOKEN,
-                ...(opts.headers || {})
-              };
-              const res = await fetch(url, { ...opts, headers });
-              const text = await res.text();
-              let data = null;
-              try { data = text ? JSON.parse(text) : null; } catch { data = text; }
-              if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText} -> ${url}\n${text}`);
-              return data;
-            }
-
-            // -------- Helpers
-            function mdEscape(s='') {
-              return String(s).replace(/([\\`*_{}[\\]()#+\\-.!|>])/g, '\\$1');
-            }
-
-            function formatTasksList(tasks) {
-              if (!Array.isArray(tasks) || tasks.length === 0) return "_Aucune tâche._";
-              return tasks.map(t => {
-                const id = t.id ?? t._id ?? t.uuid ?? "?";
-                const title = t.title ?? t.name ?? t.label ?? "(sans titre)";
-                const done = typeof t.completed === 'boolean' ? t.completed
-                           : (typeof t.status === 'string' ? t.status.toLowerCase() === 'done' : false);
-                const box = done ? "☑︎" : "☐";
-                return `- ${box} **#${id}** — ${mdEscape(title)}`;
-              }).join("\n");
-            }
-
-            async function getTasks() { return apiFetch(PATHS.list, { method: "GET" }); }
-            async function addTask(title) {
-              const payload = { title, source: "github", metadata: { issue_url: issueUrl, repository: repo, actor: process.env.GH_ACTOR } };
-              return apiFetch(PATHS.add, { method: "POST", body: JSON.stringify(payload) });
-            }
-            async function completeTask(id) {
-              if (PATHS.done.includes("{id}")) {
-                const path = PATHS.done.replace("{id}", encodeURIComponent(id));
-                try { return await apiFetch(path, { method: "PATCH", body: JSON.stringify({ status: "done" }) }); }
-                catch { return apiFetch(path, { method: "POST" }); }
-              } else {
-                return apiFetch(PATHS.done, { method: "POST", body: JSON.stringify({ id, status: "done" }) });
-              }
-            }
-            async function deleteTask(id) {
-              if (PATHS.del.includes("{id}")) {
-                const path = PATHS.del.replace("{id}", encodeURIComponent(id));
-                return apiFetch(path, { method: "DELETE" });
-              } else {
-                return apiFetch(PATHS.del, { method: "DELETE", body: JSON.stringify({ id }) });
-              }
-            }
-            async function findTaskId(arg) {
-              if (!arg) return null;
-              const idLike = arg.trim().replace(/^#/, "");
-              if (/^[0-9]+$/.test(idLike) || /^[0-9a-f-]{6,}$/i.test(idLike)) return idLike;
-              const tasks = await getTasks();
-              const lower = idLike.replace(/^"|"$/g, "").toLowerCase();
-              const found = Array.isArray(tasks) ? tasks.find(t => ((t.title ?? t.name ?? "").toLowerCase() === lower)) : null;
-              return found ? (found.id ?? found._id ?? found.uuid) : null;
-            }
-
-            function parseCommand(raw) {
-              const mention = BOT_HANDLE.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-              const re = new RegExp(`${mention}\\s+(\\w+)([\\s\\S]*)`, "i");
-              const m = raw.match(re);
-              if (!m) return null;
-              const cmd = (m[1] || "").toLowerCase();
-              const rest = (m[2] || "").trim();
-
-              let title = null;
-              const q = rest.match(/"([^"]+)"/);
-              if (q) title = q[1].trim();
-              else if (cmd === "add" && rest) title = rest;
-
-              let target = null;
-              if (cmd === "done" || cmd === "delete") {
-                const mId = rest.match(/#?([0-9a-f-]{1,})/i);
-                const mQuoted = rest.match(/"([^"]+)"/);
-                if (mQuoted) target = `"${mQuoted[1].trim()}"`;
-                else if (mId) target = mId[1];
-                else target = rest;
-              }
-              return { cmd, title, rest, target };
-            }
-
-            async function commentReply(body) {
-              if (!hasIssue) { core.info("No issue context; skipping comment: " + body); return; }
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: Number(issueNumber),
-                body
-              });
-            }
-
-            // -------- Main
-            try {
-              const parsed = parseCommand(commentBody);
-              if (!parsed) { core.info("No @bot command detected. Skipping."); return; }
-
-              const { cmd, title, target } = parsed;
-
-              if (cmd === "help") {
-                await commentReply([
-                  "🤖 **IssueOps — commandes disponibles :**",
-                  "",
-                  `- \`${BOT_HANDLE} add "Titre de la tâche"\``,
-                  `- \`${BOT_HANDLE} list\``,
-                  `- \`${BOT_HANDLE} done <#id | "titre">\``,
-                  `- \`${BOT_HANDLE} delete <#id | "titre">\``,
-                  "",
-                  "_Astuce : ajustez les chemins via les variables d’environnement du workflow._"
-                ].join("\n"));
-                return;
-              }
-
-              if (cmd === "list") {
-                const tasks = await getTasks();
-                await commentReply(`🗒️ **Tâches actuelles**\n\n${formatTasksList(tasks)}`);
-                return;
-              }
-
-              if (cmd === "add") {
-                if (!title) { await commentReply(`⚠️ Usage : \`${BOT_HANDLE} add "Titre de la tâche"\``); return; }
-                const created = await addTask(title);
-                const id = created?.id ?? created?._id ?? created?.uuid ?? "?";
-                await commentReply(`✅ Tâche ajoutée : **#${id}** — ${mdEscape(title)}`);
-                return;
-              }
-
-              if (cmd === "done" || cmd === "complete") {
-                if (!target) { await commentReply(`⚠️ Usage : \`${BOT_HANDLE} done <#id | "titre">\``); return; }
-                const id = await findTaskId(target);
-                if (!id) { await commentReply(`❌ Impossible de trouver la tâche cible \`${mdEscape(target)}\`.`); return; }
-                await completeTask(id);
-                await commentReply(`🎉 Tâche **#${id}** marquée comme *done*.`);
-                return;
-              }
-
-              if (cmd === "delete" || cmd === "remove" || cmd === "del") {
-                if (!target) { await commentReply(`⚠️ Usage : \`${BOT_HANDLE} delete <#id | "titre">\``); return; }
-                const id = await findTaskId(target);
-                if (!id) { await commentReply(`❌ Impossible de trouver la tâche cible \`${mdEscape(target)}\`.`); return; }
-                await deleteTask(id);
-                await commentReply(`🗑️ Tâche **#${id}** supprimée.`);
-                return;
-              }
-
-              await commentReply(`🤷 Commande inconnue. Essayez \`${BOT_HANDLE} help\`.`);
-
-            } catch (error) {
-              core.warning(error.stack || String(error));
-              const msg = error.message ? `\n\n\`\`\`\n${error.message.substring(0, 4000)}\n\`\`\`` : "";
-              await commentReply(`❌ **Erreur IssueOps**${msg}\n_Vérifiez les Secrets/URLs et les chemins d’API._`);
-              throw error;
-            }
+          title: "Install IssueOps GET shim (HMAC) and auto-register blueprint"
+          body: |
+            This PR adds `issueops.py` (a GET-based HMAC-signed shim) and registers the `/issueops` blueprint.
+            It enables safe GET control (add/list/done/delete) so ChatGPT (read-only web) can interact with your app.
+          branch: chore/issueops-shim
+          draft: false
