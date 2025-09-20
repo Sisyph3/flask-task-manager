@@ -49,14 +49,12 @@ jobs:
               ;;
 
             add)
+              # construit: {"title":"..."} sans heredoc
+              payload="$(jq -n --arg title "${TITLE:-}" '{title:$title}')"
               curl -s -X POST "$base_url/api/tasks" \
                 -H "Authorization: Bearer $API_TOKEN" \
                 -H "Content-Type: application/json" \
-                -d "$(python - <<'PY'
-import os, json
-print(json.dumps({"title": (os.getenv("TITLE") or "").strip()}))
-PY
-)" | jq .
+                -d "$payload" | jq .
               ;;
 
             done)
