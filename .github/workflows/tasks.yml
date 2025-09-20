@@ -5,7 +5,6 @@ on:
     types: [created, edited]
   workflow_dispatch:
 
-# Évite les collisions si plusieurs commentaires arrivent en même temps sur la même issue
 concurrency:
   group: tasks-issueops-${{ github.event.issue.number || github.run_id }}
   cancel-in-progress: false
@@ -15,25 +14,18 @@ permissions:
   issues: write
 
 env:
-  # Mention à utiliser dans les commentaires
   BOT_HANDLE: "@bot"
-
-  # Base URL + token (déjà configurés dans vos Secrets)
   TASKS_BASE_URL: ${{ secrets.TASKS_BASE_URL }}
   TASKS_API_TOKEN: ${{ secrets.TASKS_API_TOKEN }}
-
-  # Chemins d'API AJUSTABLES selon votre service Flask
   TASKS_LIST_PATH: "/tasks"
   TASKS_ADD_PATH: "/tasks"
-  TASKS_DONE_PATH: "/tasks/{id}"     # PATCH {"status":"done"} (fallback POST)
-  TASKS_DELETE_PATH: "/tasks/{id}"   # DELETE
+  TASKS_DONE_PATH: "/tasks/{id}"
+  TASKS_DELETE_PATH: "/tasks/{id}"
 
 jobs:
   issueops:
     name: Parse comment and call Tasks API
     runs-on: ubuntu-latest
-
-    # ⚠️ Ne pas utiliser env.* ici : on ne filtre que par type d'événement.
     if: ${{ github.event_name == 'issue_comment' || github.event_name == 'workflow_dispatch' }}
 
     steps:
@@ -52,7 +44,7 @@ jobs:
           GH_ACTOR: ${{ github.actor }}
         with:
           script: |
-            const core = require('@actions/core');
+            // ⬅️ NE PAS re-déclarer `core`, `github`, `context` (déjà injectés par github-script)
 
             // -------- Config
             const BOT_HANDLE = process.env.BOT_HANDLE || "@bot";
@@ -84,4 +76,153 @@ jobs:
               };
               const res = await fetch(url, { ...opts, headers });
               const text = await res.text();
-              let data
+              let data = null;
+              try { data = text ? JSON.parse(text) : null; } catch { data = text; }
+              if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText} -> ${url}\n${text}`);
+              return data;
+            }
+
+            // -------- Helpers
+            function mdEscape(s='') {
+              return String(s).replace(/([\\`*_{}[\\]()#+\\-.!|>])/g, '\\$1');
+            }
+
+            function formatTasksList(tasks) {
+              if (!Array.isArray(tasks) || tasks.length === 0) return "_Aucune tâche._";
+              return tasks.map(t => {
+                const id = t.id ?? t._id ?? t.uuid ?? "?";
+                const title = t.title ?? t.name ?? t.label ?? "(sans titre)";
+                const done = typeof t.completed === 'boolean' ? t.completed
+                           : (typeof t.status === 'string' ? t.status.toLowerCase() === 'done' : false);
+                const box = done ? "☑︎" : "☐";
+                return `- ${box} **#${id}** — ${mdEscape(title)}`;
+              }).join("\n");
+            }
+
+            async function getTasks() { return apiFetch(PATHS.list, { method: "GET" }); }
+            async function addTask(title) {
+              const payload = { title, source: "github", metadata: { issue_url: issueUrl, repository: repo, actor: process.env.GH_ACTOR } };
+              return apiFetch(PATHS.add, { method: "POST", body: JSON.stringify(payload) });
+            }
+            async function completeTask(id) {
+              if (PATHS.done.includes("{id}")) {
+                const path = PATHS.done.replace("{id}", encodeURIComponent(id));
+                try { return await apiFetch(path, { method: "PATCH", body: JSON.stringify({ status: "done" }) }); }
+                catch { return apiFetch(path, { method: "POST" }); }
+              } else {
+                return apiFetch(PATHS.done, { method: "POST", body: JSON.stringify({ id, status: "done" }) });
+              }
+            }
+            async function deleteTask(id) {
+              if (PATHS.del.includes("{id}")) {
+                const path = PATHS.del.replace("{id}", encodeURIComponent(id));
+                return apiFetch(path, { method: "DELETE" });
+              } else {
+                return apiFetch(PATHS.del, { method: "DELETE", body: JSON.stringify({ id }) });
+              }
+            }
+            async function findTaskId(arg) {
+              if (!arg) return null;
+              const idLike = arg.trim().replace(/^#/, "");
+              if (/^[0-9]+$/.test(idLike) || /^[0-9a-f-]{6,}$/i.test(idLike)) return idLike;
+              const tasks = await getTasks();
+              const lower = idLike.replace(/^"|"$/g, "").toLowerCase();
+              const found = Array.isArray(tasks) ? tasks.find(t => ((t.title ?? t.name ?? "").toLowerCase() === lower)) : null;
+              return found ? (found.id ?? found._id ?? found.uuid) : null;
+            }
+
+            function parseCommand(raw) {
+              const mention = BOT_HANDLE.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+              const re = new RegExp(`${mention}\\s+(\\w+)([\\s\\S]*)`, "i");
+              const m = raw.match(re);
+              if (!m) return null;
+              const cmd = (m[1] || "").toLowerCase();
+              const rest = (m[2] || "").trim();
+
+              let title = null;
+              const q = rest.match(/"([^"]+)"/);
+              if (q) title = q[1].trim();
+              else if (cmd === "add" && rest) title = rest;
+
+              let target = null;
+              if (cmd === "done" || cmd === "delete") {
+                const mId = rest.match(/#?([0-9a-f-]{1,})/i);
+                const mQuoted = rest.match(/"([^"]+)"/);
+                if (mQuoted) target = `"${mQuoted[1].trim()}"`;
+                else if (mId) target = mId[1];
+                else target = rest;
+              }
+              return { cmd, title, rest, target };
+            }
+
+            async function commentReply(body) {
+              if (!hasIssue) { core.info("No issue context; skipping comment: " + body); return; }
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: Number(issueNumber),
+                body
+              });
+            }
+
+            // -------- Main
+            try {
+              const parsed = parseCommand(commentBody);
+              if (!parsed) { core.info("No @bot command detected. Skipping."); return; }
+
+              const { cmd, title, target } = parsed;
+
+              if (cmd === "help") {
+                await commentReply([
+                  "🤖 **IssueOps — commandes disponibles :**",
+                  "",
+                  `- \`${BOT_HANDLE} add "Titre de la tâche"\``,
+                  `- \`${BOT_HANDLE} list\``,
+                  `- \`${BOT_HANDLE} done <#id | "titre">\``,
+                  `- \`${BOT_HANDLE} delete <#id | "titre">\``,
+                  "",
+                  "_Astuce : ajustez les chemins via les variables d’environnement du workflow._"
+                ].join("\n"));
+                return;
+              }
+
+              if (cmd === "list") {
+                const tasks = await getTasks();
+                await commentReply(`🗒️ **Tâches actuelles**\n\n${formatTasksList(tasks)}`);
+                return;
+              }
+
+              if (cmd === "add") {
+                if (!title) { await commentReply(`⚠️ Usage : \`${BOT_HANDLE} add "Titre de la tâche"\``); return; }
+                const created = await addTask(title);
+                const id = created?.id ?? created?._id ?? created?.uuid ?? "?";
+                await commentReply(`✅ Tâche ajoutée : **#${id}** — ${mdEscape(title)}`);
+                return;
+              }
+
+              if (cmd === "done" || cmd === "complete") {
+                if (!target) { await commentReply(`⚠️ Usage : \`${BOT_HANDLE} done <#id | "titre">\``); return; }
+                const id = await findTaskId(target);
+                if (!id) { await commentReply(`❌ Impossible de trouver la tâche cible \`${mdEscape(target)}\`.`); return; }
+                await completeTask(id);
+                await commentReply(`🎉 Tâche **#${id}** marquée comme *done*.`);
+                return;
+              }
+
+              if (cmd === "delete" || cmd === "remove" || cmd === "del") {
+                if (!target) { await commentReply(`⚠️ Usage : \`${BOT_HANDLE} delete <#id | "titre">\``); return; }
+                const id = await findTaskId(target);
+                if (!id) { await commentReply(`❌ Impossible de trouver la tâche cible \`${mdEscape(target)}\`.`); return; }
+                await deleteTask(id);
+                await commentReply(`🗑️ Tâche **#${id}** supprimée.`);
+                return;
+              }
+
+              await commentReply(`🤷 Commande inconnue. Essayez \`${BOT_HANDLE} help\`.`);
+
+            } catch (error) {
+              core.warning(error.stack || String(error));
+              const msg = error.message ? `\n\n\`\`\`\n${error.message.substring(0, 4000)}\n\`\`\`` : "";
+              await commentReply(`❌ **Erreur IssueOps**${msg}\n_Vérifiez les Secrets/URLs et les chemins d’API._`);
+              throw error;
+            }
